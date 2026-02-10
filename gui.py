@@ -10,12 +10,12 @@ from PyQt6.QtWidgets import (
     QHeaderView, QGroupBox, QScrollArea, QSplitter, QTextEdit, QTabWidget,
     QGridLayout, QMessageBox, QDoubleSpinBox, QSizePolicy, QGraphicsBlurEffect, QStackedLayout
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QPointF
-from PyQt6.QtGui import QPixmap, QIcon, QColor, QAction, QPainter, QPen, QBrush, QPainterPath
+from PyQt6.QtCore import Qt, QSize, QTimer, QPointF, QUrl
+from PyQt6.QtGui import QPixmap, QIcon, QColor, QAction, QPainter, QPen, QBrush, QPainterPath, QDesktopServices
 from crawler import CrawlerWorker
 from utils import get_app_path, get_resource_path
 
-VERSION = "v1.0.5"
+VERSION = "v1.0.8"
 
 # Global exception hook to capture crashes in compiled exe
 def exception_hook(exctype, value, tb):
@@ -65,18 +65,18 @@ class ImagePreviewWidget(QWidget):
         
         # Toggle Button (Floating)
         self.toggle_btn = QPushButton(self)
-        self.toggle_btn.setFixedSize(36, 36)
+        self.toggle_btn.setFixedSize(28, 28)
         # Use generated icons instead of text
         self.icon_eye = self.create_eye_icon(crossed=False)
         self.icon_crossed = self.create_eye_icon(crossed=True)
         self.toggle_btn.setIcon(self.icon_eye)
-        self.toggle_btn.setIconSize(QSize(20, 20))
+        self.toggle_btn.setIconSize(QSize(24, 24))
         
         self.toggle_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255, 255, 255, 120);
                 border: 1px solid rgba(255, 255, 255, 180);
-                border-radius: 18px;
+                border-radius: 14px;
             }
             QPushButton:hover {
                 background-color: rgba(255, 255, 255, 200);
@@ -89,6 +89,7 @@ class ImagePreviewWidget(QWidget):
         
         self.is_private = False
         self.current_raw_pixmap = None
+        self.current_path = None
         
     def create_eye_icon(self, crossed=False):
         pixmap = QPixmap(32, 32)
@@ -96,39 +97,41 @@ class ImagePreviewWidget(QWidget):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Color: Dark Gray for visibility on light glass background
-        color = QColor("#424242")
+        # Color: Lighter Gray for a softer look
+        color = QColor("#9E9E9E")
         pen = QPen(color)
         pen.setWidth(2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         
-        # Draw Eye Outline (Almond shape)
+        # Draw Eye Outline (Almond shape) - Maximized for 32x32 canvas
         path = QPainterPath()
-        path.moveTo(4, 16)
-        path.quadTo(16, 6, 28, 16) # Top arc
-        path.quadTo(16, 26, 4, 16) # Bottom arc
+        # Start left (2, 16)
+        path.moveTo(2, 16)
+        # Top curve to (30, 16) via (16, 2)
+        path.quadTo(16, 2, 30, 16) 
+        # Bottom curve back to (2, 16) via (16, 30)
+        path.quadTo(16, 30, 2, 16) 
         painter.drawPath(path)
         
         # Draw Pupil
         painter.setBrush(QBrush(color))
-        painter.drawEllipse(QPointF(16, 16), 4, 4)
+        painter.drawEllipse(QPointF(16, 16), 5, 5)
         
         if crossed:
             # Draw Slash
             pen.setWidth(3)
-            # Make the slash color slightly reddish or just same gray? 
-            # User dislikes "colored", so stick to monochrome/dark gray.
-            pen.setColor(QColor("#424242")) 
+            pen.setColor(QColor("#9E9E9E")) 
             painter.setPen(pen)
-            painter.drawLine(6, 6, 26, 26)
+            # From top-left to bottom-right, fitting the new size
+            painter.drawLine(4, 4, 28, 28)
             
         painter.end()
         return QIcon(pixmap)
         
     def resizeEvent(self, event):
-        self.toggle_btn.move(self.width() - 46, 10)
+        self.toggle_btn.move(self.width() - 38, 10)
         self.update_display()
         super().resizeEvent(event)
         
@@ -141,8 +144,9 @@ class ImagePreviewWidget(QWidget):
             self.blur_effect.setBlurRadius(0)
             self.toggle_btn.setIcon(self.icon_eye)
             
-    def set_pixmap(self, pixmap):
+    def set_pixmap(self, pixmap, path=None):
         self.current_raw_pixmap = pixmap
+        self.current_path = path
         self.update_display()
 
     def update_display(self):
@@ -154,6 +158,20 @@ class ImagePreviewWidget(QWidget):
                 self.image_label.setPixmap(scaled)
         else:
             self.image_label.setText("无预览")
+            
+    def mouseDoubleClickEvent(self, event):
+        if self.current_path and os.path.exists(self.current_path):
+            try:
+                # Use os.startfile on Windows for better compatibility with default viewers
+                os.startfile(self.current_path)
+            except Exception as e:
+                print(f"Error opening file: {e}")
+                # Fallback
+                try:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(self.current_path))
+                except:
+                    pass
+        super().mouseDoubleClickEvent(event)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -357,12 +375,16 @@ class MainWindow(QMainWindow):
         task_group = QGroupBox("任务列表")
         task_layout = QVBoxLayout()
         self.task_table = QTableWidget()
-        self.task_table.setColumnCount(4)
-        self.task_table.setHorizontalHeaderLabels(["状态", "URL", "标题", "发表时间"])
+        self.task_table.setColumnCount(5)
+        self.task_table.setHorizontalHeaderLabels(["状态", "地址", "标题", "时间", "操作"])
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.task_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.task_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.task_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.task_table.setColumnWidth(4, 60)
+        self.task_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.task_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         task_layout.addWidget(self.task_table)
         task_group.setLayout(task_layout)
         right_splitter.addWidget(task_group)
@@ -565,7 +587,7 @@ class MainWindow(QMainWindow):
                 self.task_table.setItem(r, 1, QTableWidgetItem(new_url))
                 break
 
-    def update_task_status(self, url, status, title, date_str):
+    def update_task_status(self, url, status, title, date_str, local_path=""):
         # Check if URL exists in table
         rows = self.task_table.rowCount()
         found_row = -1
@@ -583,6 +605,28 @@ class MainWindow(QMainWindow):
             # Set custom row number (cumulative count)
             self.total_tasks_count += 1
             self.task_table.setVerticalHeaderItem(0, QTableWidgetItem(str(self.total_tasks_count)))
+            
+            # Add Open Folder Button
+            btn_open = QPushButton("📂")
+            btn_open.setToolTip("打开文件夹")
+            btn_open.setFixedSize(30, 24)
+            btn_open.setStyleSheet("padding: 2px;")
+            # Use lambda with default argument to capture current path, but wait, local_path might change?
+            # Actually local_path is sent with updates. We should store it in the item data.
+            # But here we can just connect it to a method that reads the data.
+            btn_open.clicked.connect(lambda: self.open_task_folder(url))
+            
+            # Center the button
+            widget = QWidget()
+            layout = QHBoxLayout(widget)
+            layout.setContentsMargins(0,0,0,0)
+            layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(btn_open)
+            self.task_table.setCellWidget(0, 4, widget)
+
+        # Store local_path in the URL item for retrieval
+        if local_path:
+             self.task_table.item(found_row, 1).setData(Qt.ItemDataRole.UserRole, local_path)
             
         # Update status icon
         icon_label = QLabel()
@@ -615,6 +659,25 @@ class MainWindow(QMainWindow):
         self.task_table.setItem(found_row, 2, QTableWidgetItem(title))
         self.task_table.setItem(found_row, 3, QTableWidgetItem(date_str))
 
+    def open_task_folder(self, url):
+        # Find row by url
+        rows = self.task_table.rowCount()
+        for r in range(rows):
+            item = self.task_table.item(r, 1)
+            if item.text() == url:
+                local_path = item.data(Qt.ItemDataRole.UserRole)
+                if local_path and os.path.exists(local_path):
+                    try:
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(local_path))
+                    except Exception as e:
+                        print(f"Error opening folder: {e}")
+                else:
+                    # Try to guess path if not stored (fallback)
+                    # But actually we don't have enough info here to guess accurately without title/date
+                    # So we just warn
+                    pass
+                break
+
     def add_image_to_gallery(self, url, path):
         # Insert at top (reverse order)
         self.image_list.insertRow(0)
@@ -636,7 +699,7 @@ class MainWindow(QMainWindow):
     def show_preview(self, path):
         if os.path.exists(path):
             pixmap = QPixmap(path)
-            self.preview_widget.set_pixmap(pixmap)
+            self.preview_widget.set_pixmap(pixmap, path)
         else:
             self.preview_widget.set_pixmap(None)
 

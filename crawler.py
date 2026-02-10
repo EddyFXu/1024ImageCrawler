@@ -15,7 +15,7 @@ import datetime
 
 class CrawlerSignals(QObject):
     log = pyqtSignal(str, str) # message, level (info, error, success)
-    status_update = pyqtSignal(str, str, str, str) # url, status (running, done, error), title, date_str
+    status_update = pyqtSignal(str, str, str, str, str) # url, status (running, done, error), title, date_str, local_path
     redirected = pyqtSignal(str, str) # old_url, new_url
     progress = pyqtSignal(str, int, int)
     image_downloaded = pyqtSignal(str, str)
@@ -85,7 +85,7 @@ class CrawlerWorker(QThread):
 
     def process_page(self, url, mode):
         self.signals.log.emit(f"Analyzing [v1.0.1] {url}...", "info")
-        self.signals.status_update.emit(url, "running", "Analyzing...", "")
+        self.signals.status_update.emit(url, "running", "Analyzing...", "", "")
         
         try:
             # 回滚：请求页面时不带 Referer，模拟直接访问
@@ -204,7 +204,15 @@ class CrawlerWorker(QThread):
                             pass
 
             date_display = page_date.strftime('%Y-%m-%d %H:%M') if page_date else 'No Date'
-            self.signals.status_update.emit(url, "running", title, date_display)
+            
+            # Determine Local Path (approximate, since we don't have filename yet)
+            # Use the folder where images will be saved
+            naming_pattern = self.config.get('naming_pattern', '{page.title}/{filename}')
+            # We construct a dummy filename to get the directory
+            dummy_path = format_filename(url, title, page_date, "dummy.jpg", 0, naming_pattern)
+            local_save_dir = os.path.dirname(os.path.join(self.config.get('save_dir', 'downloads'), dummy_path))
+            
+            self.signals.status_update.emit(url, "running", title, date_display, local_save_dir)
             
             # Find Images
             content_div = soup.find('div', id='read_tpc') or soup.find('div', class_='tpc_content')
@@ -250,7 +258,7 @@ class CrawlerWorker(QThread):
             self.signals.log.emit(f"Found {len(image_urls)} valid images to download.", "info")
             if not image_urls:
                 self.signals.log.emit("No valid images found matching configuration. Check allowed formats.", "warning")
-                self.signals.status_update.emit(url, "warning", title, date_display)
+                self.signals.status_update.emit(url, "warning", title, date_display, local_save_dir)
                 # Do not return here, continue to navigation
             else:
                 # Download Images
@@ -286,11 +294,11 @@ class CrawlerWorker(QThread):
 
                 # Status Update
                 if downloaded_count == total_images:
-                    self.signals.status_update.emit(url, "success", title, date_display)
+                    self.signals.status_update.emit(url, "success", title, date_display, local_save_dir)
                 elif downloaded_count > 0:
-                    self.signals.status_update.emit(url, "warning", title, date_display)
+                    self.signals.status_update.emit(url, "warning", title, date_display, local_save_dir)
                 else:
-                    self.signals.status_update.emit(url, "error", title, date_display)
+                    self.signals.status_update.emit(url, "error", title, date_display, local_save_dir)
 
             # Navigation
             if mode == 'free':
@@ -414,7 +422,7 @@ class CrawlerWorker(QThread):
 
         except Exception as e:
             self.signals.log.emit(f"Error processing {url}: {str(e)}", "error")
-            self.signals.status_update.emit(url, "error", "Failed", "")
+            self.signals.status_update.emit(url, "error", "Failed", "", "")
 
     def download_image(self, img_url, page_url, page_title, page_date, index):
         max_retries = 3
