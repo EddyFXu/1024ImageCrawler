@@ -425,7 +425,7 @@ class CrawlerWorker(QThread):
             self.signals.status_update.emit(url, "error", "Failed", "", "")
 
     def download_image(self, img_url, page_url, page_title, page_date, index):
-        max_retries = 3
+        max_retries = int(self.config.get('img_retries', 3))
         # 使用页面 URL 作为 Referer，但手动添加，不依赖 get_headers 参数
         headers = self.get_headers()
         headers['Referer'] = page_url
@@ -453,7 +453,8 @@ class CrawlerWorker(QThread):
                     return True
 
                 self.signals.log.emit(f"Downloading {img_url} (Attempt {attempt+1}/{max_retries})...", "info")
-                resp = self.session.get(img_url, headers=headers, timeout=30, stream=True)
+                timeout = float(self.config.get('img_timeout', 30.0))
+                resp = self.session.get(img_url, headers=headers, timeout=timeout, stream=True)
                 
                 if resp.status_code != 200:
                     raise Exception(f"HTTP {resp.status_code}")

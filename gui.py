@@ -8,14 +8,14 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QRadioButton, QButtonGroup, 
     QCheckBox, QComboBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QScrollArea, QSplitter, QTextEdit, QTabWidget,
-    QGridLayout, QMessageBox, QDoubleSpinBox, QSizePolicy, QGraphicsBlurEffect, QStackedLayout
+    QGridLayout, QMessageBox, QDoubleSpinBox, QSpinBox, QSizePolicy, QGraphicsBlurEffect, QStackedLayout
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QPointF, QUrl
 from PyQt6.QtGui import QPixmap, QIcon, QColor, QAction, QPainter, QPen, QBrush, QPainterPath, QDesktopServices
 from crawler import CrawlerWorker
 from utils import get_app_path, get_resource_path
 
-VERSION = "v1.0.8"
+VERSION = "v1.0.9"
 
 # Global exception hook to capture crashes in compiled exe
 def exception_hook(exctype, value, tb):
@@ -320,7 +320,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(set_group)
         
         # 5. Delays
-        delay_group = QGroupBox("延迟设置 (秒)")
+        delay_group = QGroupBox("延迟与重试设置")
         delay_layout = QGridLayout()
         
         delay_layout.addWidget(QLabel("页面间隔:"), 0, 0)
@@ -344,6 +344,20 @@ class MainWindow(QMainWindow):
         self.img_delay_max.setRange(0.0, 10.0)
         self.img_delay_max.setValue(0.5)
         delay_layout.addWidget(self.img_delay_max, 1, 3)
+
+        # Image timeout (seconds)
+        delay_layout.addWidget(QLabel("图片超时(s):"), 2, 0)
+        self.img_timeout_spin = QDoubleSpinBox()
+        self.img_timeout_spin.setRange(1.0, 120.0)
+        self.img_timeout_spin.setValue(30.0)
+        delay_layout.addWidget(self.img_timeout_spin, 2, 1)
+
+        # Image retry count
+        delay_layout.addWidget(QLabel("重试次数:"), 3, 0)
+        self.img_retry_spin = QSpinBox()
+        self.img_retry_spin.setRange(0, 10)
+        self.img_retry_spin.setValue(3)
+        delay_layout.addWidget(self.img_retry_spin, 3, 1)
         
         delay_group.setLayout(delay_layout)
         left_layout.addWidget(delay_group)
@@ -458,6 +472,12 @@ class MainWindow(QMainWindow):
             i_min, i_max = data.get('img_delay', (0.1, 0.5))
             self.img_delay_min.setValue(i_min)
             self.img_delay_max.setValue(i_max)
+
+            img_timeout = data.get('img_timeout', 30.0)
+            self.img_timeout_spin.setValue(img_timeout)
+
+            img_retries = data.get('img_retries', 3)
+            self.img_retry_spin.setValue(img_retries)
             
             self.last_success_url = data.get('last_success_url', '')
             if self.last_success_url:
@@ -511,7 +531,9 @@ class MainWindow(QMainWindow):
             'min_res': self.parse_resolution(),
             'formats': [('.' + f if not f.startswith('.') else f) for f, cb in self.fmt_checks.items() if cb.isChecked()],
             'page_delay': (self.page_delay_min.value(), self.page_delay_max.value()),
-            'img_delay': (self.img_delay_min.value(), self.img_delay_max.value())
+            'img_delay': (self.img_delay_min.value(), self.img_delay_max.value()),
+            'img_timeout': self.img_timeout_spin.value(),
+            'img_retries': self.img_retry_spin.value()
         }
         
         self.save_config()
@@ -725,6 +747,8 @@ class MainWindow(QMainWindow):
             'formats': [f for f, cb in self.fmt_checks.items() if cb.isChecked()],
             'page_delay': (self.page_delay_min.value(), self.page_delay_max.value()),
             'img_delay': (self.img_delay_min.value(), self.img_delay_max.value()),
+            'img_timeout': self.img_timeout_spin.value(),
+            'img_retries': self.img_retry_spin.value(),
             'last_success_url': self.last_success_url
         }
         with open(CONFIG_FILE, 'w') as f:
