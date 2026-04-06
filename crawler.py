@@ -43,6 +43,10 @@ class CrawlerWorker(QThread):
         adapter = HTTPAdapter(max_retries=retries)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
+
+        cookie = str(self.config.get('cookie', '')).strip()
+        if cookie:
+            self.session.headers.update({'Cookie': cookie})
         
     def run(self):
         try:
@@ -74,8 +78,12 @@ class CrawlerWorker(QThread):
 
     def get_headers(self):
         # 使用固定的桌面端 User-Agent，避免移动端页面结构差异导致解析失败
+        ua = self.config.get('ua_override', '') if isinstance(self.config, dict) else ''
+        ua = ua.strip() if isinstance(ua, str) else ''
+        if not ua:
+            ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         return {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': ua,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Connection': 'keep-alive',
@@ -90,6 +98,10 @@ class CrawlerWorker(QThread):
         try:
             # 回滚：请求页面时不带 Referer，模拟直接访问
             resp = self.session.get(url, headers=self.get_headers(), timeout=15)
+            if resp.status_code in (401, 403):
+                self.signals.log.emit("页面访问被拒绝(401/403)，可能触发验证/需要Cookie。请在浏览器通过验证后复制Cookie到软件设置。", "error")
+                self.signals.status_update.emit(url, "error", "需要验证", "", "")
+                return
             
             # Check for redirection
             if resp.url != url:
@@ -111,6 +123,11 @@ class CrawlerWorker(QThread):
                 resp.encoding = resp.apparent_encoding if resp.apparent_encoding else 'utf-8'
             
             self.signals.log.emit(f"Encoding detected: {resp.encoding}", "info")
+            preview_text = resp.text[:5000]
+            if "验证码" in preview_text or "captcha" in preview_text.lower():
+                self.signals.log.emit("疑似出现验证码/验证页面，可能需要Cookie。请在浏览器通过验证后复制Cookie到软件设置。", "error")
+                self.signals.status_update.emit(url, "error", "需要验证", "", "")
+                return
 
             soup = BeautifulSoup(resp.text, 'html.parser')
             
@@ -122,6 +139,21 @@ class CrawlerWorker(QThread):
             else:
                 title = soup.title.string.strip() if soup.title else "Unknown Title"
             
+            # --- Keyword Filter ---
+            raw_keywords = self.config.get('keywords', '').strip()
+            if raw_keywords:
+                # Split by space or comma, remove empty
+                keywords = [k.strip().lower() for k in re.split(r'[,\s，、]', raw_keywords) if k.strip()]
+                if keywords:
+                    title_lower = title.lower()
+                    found = any(k in title_lower for k in keywords)
+                    if not found:
+                        self.signals.log.emit(f"Skipping page: title '{title}' does not match keywords {keywords}", "warning")
+                        self.signals.status_update.emit(url, "warning", title, "Filtered", "")
+                        # Continue to navigation section by not downloading images
+                        self.handle_navigation(soup, url, mode)
+                        return
+
             # Date
             page_date = None
             date_str = ""
@@ -204,6 +236,27 @@ class CrawlerWorker(QThread):
                             pass
 
             date_display = page_date.strftime('%Y-%m-%d %H:%M') if page_date else 'No Date'
+
+            if bool(self.config.get('date_filter_enabled', False)):
+                date_from_str = str(self.config.get('date_from', '')).strip()
+                date_to_str = str(self.config.get('date_to', '')).strip()
+                date_from = datetime.datetime.strptime(date_from_str, '%Y-%m-%d').date() if date_from_str else None
+                date_to = datetime.datetime.strptime(date_to_str, '%Y-%m-%d').date() if date_to_str else None
+                if date_from and date_to and date_from > date_to:
+                    date_from, date_to = date_to, date_from
+
+                if not page_date:
+                    self.signals.log.emit(f"跳过: 未解析到发表时间，无法匹配时间范围 ({date_from_str}~{date_to_str})", "warning")
+                    self.signals.status_update.emit(url, "warning", title, date_display, "")
+                    self.handle_navigation(soup, url, mode)
+                    return
+
+                page_day = page_date.date()
+                if (date_from and page_day < date_from) or (date_to and page_day > date_to):
+                    self.signals.log.emit(f"跳过: 发表时间 {page_day} 不在范围 ({date_from_str}~{date_to_str})", "info")
+                    self.signals.status_update.emit(url, "warning", title, date_display, "")
+                    self.handle_navigation(soup, url, mode)
+                    return
             
             # Determine Local Path (approximate, since we don't have filename yet)
             # Use the folder where images will be saved
@@ -301,103 +354,56 @@ class CrawlerWorker(QThread):
                     self.signals.status_update.emit(url, "error", title, date_display, local_save_dir)
 
             # Navigation
-            if mode == 'free':
-                # Logic: Try Next, then Prev
-                next_link = soup.find('a', string=lambda t: t and '下一主题' in t)
-                if next_link:
-                    next_url = urljoin(url, next_link.get('href'))
-                    if 'job.php' in next_url:
-                        try:
-                            self.signals.log.emit(f"Resolving redirect: {next_url}", "info")
-                            # Remove stream=True to access text for HTML redirect check
-                            r = self.session.get(next_url, headers=self.get_headers(), timeout=10)
-                            resolved_url = r.url
-                            
-                            # Check for HTML meta refresh or JS redirect if URL is still job.php
-                            if 'job.php' in resolved_url:
-                                content = r.text
-                                # Meta refresh: <meta http-equiv="refresh" content="0;url=read.php?tid=...">
-                                meta_match = re.search(r'url=([^"\'>]+)', content, re.IGNORECASE)
-                                if meta_match:
-                                    resolved_url = urljoin(next_url, meta_match.group(1))
-                                else:
-                                    # JS location: location.href = 'read.php?tid=...';
-                                    js_match = re.search(r"location\.href\s*=\s*['\"](.*?)['\"]", content)
-                                    if js_match:
-                                        resolved_url = urljoin(next_url, js_match.group(1))
-                            
-                            next_url = resolved_url
-                            r.close()
-                            self.signals.log.emit(f"Resolved to: {next_url}", "info")
-                        except Exception as e:
-                            self.signals.log.emit(f"Redirect resolution failed: {e}", "warning")
-                    
-                    if 'job.php' not in next_url:
-                        self.url_queue.append(next_url)
-                        self.signals.log.emit(f"Free Explore: Found next topic {next_url}", "info")
-                    else:
-                        self.signals.log.emit(f"Free Explore: Skipping failed redirect {next_url}", "warning")
-                else:
-                    self.signals.log.emit("Free Explore: No next topic, trying previous...", "warning")
-                    prev_link = soup.find('a', string=lambda t: t and '上一主题' in t)
-                    if prev_link:
-                        prev_url = urljoin(url, prev_link.get('href'))
-                        if 'job.php' in prev_url:
-                            try:
-                                r = self.session.get(prev_url, headers=self.get_headers(), timeout=10)
-                                resolved_url = r.url
-                                if 'job.php' in resolved_url:
-                                    content = r.text
-                                    meta_match = re.search(r'url=([^"\'>]+)', content, re.IGNORECASE)
-                                    if meta_match: resolved_url = urljoin(prev_url, meta_match.group(1))
-                                    else:
-                                        js_match = re.search(r"location\.href\s*=\s*['\"](.*?)['\"]", content)
-                                        if js_match: resolved_url = urljoin(prev_url, js_match.group(1))
-                                prev_url = resolved_url
-                                r.close()
-                            except: pass
-                        
-                        if 'job.php' not in prev_url:
-                            self.url_queue.append(prev_url)
-                        else:
-                            self.signals.log.emit(f"Free Explore: Skipping failed redirect {prev_url}", "warning")
-            
-            elif mode == 'next':
-                next_link = soup.find('a', string=lambda t: t and '下一主题' in t)
-                if next_link:
-                    next_url = urljoin(url, next_link.get('href'))
-                    if 'job.php' in next_url:
-                        try:
-                            self.signals.log.emit(f"Resolving redirect: {next_url}", "info")
-                            r = self.session.get(next_url, headers=self.get_headers(), timeout=10)
-                            resolved_url = r.url
-                            if 'job.php' in resolved_url:
-                                content = r.text
-                                meta_match = re.search(r'url=([^"\'>]+)', content, re.IGNORECASE)
-                                if meta_match: resolved_url = urljoin(next_url, meta_match.group(1))
-                                else:
-                                    js_match = re.search(r"location\.href\s*=\s*['\"](.*?)['\"]", content)
-                                    if js_match: resolved_url = urljoin(next_url, js_match.group(1))
-                            next_url = resolved_url
-                            r.close()
-                            self.signals.log.emit(f"Resolved to: {next_url}", "info")
-                        except Exception as e:
-                            self.signals.log.emit(f"Redirect resolution failed: {e}", "warning")
-                            
-                    if 'job.php' not in next_url:
-                        self.url_queue.append(next_url)
-                    else:
-                        self.signals.log.emit(f"Skipping failed redirect: {next_url}", "warning")
-                else:
-                    self.signals.log.emit("No next topic found.", "warning")
+            self.handle_navigation(soup, url, mode)
 
-            elif mode == 'prev':
+        except Exception as e:
+            self.signals.log.emit(f"Error processing {url}: {str(e)}", "error")
+            self.signals.status_update.emit(url, "error", "Failed", "", "")
+
+    def handle_navigation(self, soup, url, mode):
+        if mode == 'free':
+            # Logic: Try Next, then Prev
+            next_link = soup.find('a', string=lambda t: t and '下一主题' in t)
+            if next_link:
+                next_url = urljoin(url, next_link.get('href'))
+                if 'job.php' in next_url:
+                    try:
+                        self.signals.log.emit(f"Resolving redirect: {next_url}", "info")
+                        # Remove stream=True to access text for HTML redirect check
+                        r = self.session.get(next_url, headers=self.get_headers(), timeout=10)
+                        resolved_url = r.url
+                        
+                        # Check for HTML meta refresh or JS redirect if URL is still job.php
+                        if 'job.php' in resolved_url:
+                            content = r.text
+                            # Meta refresh: <meta http-equiv="refresh" content="0;url=read.php?tid=...">
+                            meta_match = re.search(r'url=([^"\'>]+)', content, re.IGNORECASE)
+                            if meta_match:
+                                resolved_url = urljoin(next_url, meta_match.group(1))
+                            else:
+                                # JS location: location.href = 'read.php?tid=...';
+                                js_match = re.search(r"location\.href\s*=\s*['\"](.*?)['\"]", content)
+                                if js_match:
+                                    resolved_url = urljoin(next_url, js_match.group(1))
+                        
+                        next_url = resolved_url
+                        r.close()
+                        self.signals.log.emit(f"Resolved to: {next_url}", "info")
+                    except Exception as e:
+                        self.signals.log.emit(f"Redirect resolution failed: {e}", "warning")
+                
+                if 'job.php' not in next_url:
+                    self.url_queue.append(next_url)
+                    self.signals.log.emit(f"Free Explore: Found next topic {next_url}", "info")
+                else:
+                    self.signals.log.emit(f"Free Explore: Skipping failed redirect {next_url}", "warning")
+            else:
+                self.signals.log.emit("Free Explore: No next topic, trying previous...", "warning")
                 prev_link = soup.find('a', string=lambda t: t and '上一主题' in t)
                 if prev_link:
                     prev_url = urljoin(url, prev_link.get('href'))
                     if 'job.php' in prev_url:
                         try:
-                            self.signals.log.emit(f"Resolving redirect: {prev_url}", "info")
                             r = self.session.get(prev_url, headers=self.get_headers(), timeout=10)
                             resolved_url = r.url
                             if 'job.php' in resolved_url:
@@ -409,26 +415,77 @@ class CrawlerWorker(QThread):
                                     if js_match: resolved_url = urljoin(prev_url, js_match.group(1))
                             prev_url = resolved_url
                             r.close()
-                            self.signals.log.emit(f"Resolved to: {prev_url}", "info")
-                        except Exception as e:
-                            self.signals.log.emit(f"Redirect resolution failed: {e}", "warning")
-                            
+                        except: pass
+                    
                     if 'job.php' not in prev_url:
                         self.url_queue.append(prev_url)
                     else:
-                        self.signals.log.emit(f"Skipping failed redirect: {prev_url}", "warning")
+                        self.signals.log.emit(f"Free Explore: Skipping failed redirect {prev_url}", "warning")
+        
+        elif mode == 'next':
+            next_link = soup.find('a', string=lambda t: t and '下一主题' in t)
+            if next_link:
+                next_url = urljoin(url, next_link.get('href'))
+                if 'job.php' in next_url:
+                    try:
+                        self.signals.log.emit(f"Resolving redirect: {next_url}", "info")
+                        r = self.session.get(next_url, headers=self.get_headers(), timeout=10)
+                        resolved_url = r.url
+                        if 'job.php' in resolved_url:
+                            content = r.text
+                            meta_match = re.search(r'url=([^"\'>]+)', content, re.IGNORECASE)
+                            if meta_match: resolved_url = urljoin(next_url, meta_match.group(1))
+                            else:
+                                js_match = re.search(r"location\.href\s*=\s*['\"](.*?)['\"]", content)
+                                if js_match: resolved_url = urljoin(next_url, js_match.group(1))
+                        next_url = resolved_url
+                        r.close()
+                        self.signals.log.emit(f"Resolved to: {next_url}", "info")
+                    except Exception as e:
+                        self.signals.log.emit(f"Redirect resolution failed: {e}", "warning")
+                        
+                if 'job.php' not in next_url:
+                    self.url_queue.append(next_url)
                 else:
-                    self.signals.log.emit("No previous topic found.", "warning")
+                    self.signals.log.emit(f"Skipping failed redirect: {next_url}", "warning")
+            else:
+                self.signals.log.emit("No next topic found.", "warning")
 
-        except Exception as e:
-            self.signals.log.emit(f"Error processing {url}: {str(e)}", "error")
-            self.signals.status_update.emit(url, "error", "Failed", "", "")
+        elif mode == 'prev':
+            prev_link = soup.find('a', string=lambda t: t and '上一主题' in t)
+            if prev_link:
+                prev_url = urljoin(url, prev_link.get('href'))
+                if 'job.php' in prev_url:
+                    try:
+                        self.signals.log.emit(f"Resolving redirect: {prev_url}", "info")
+                        r = self.session.get(prev_url, headers=self.get_headers(), timeout=10)
+                        resolved_url = r.url
+                        if 'job.php' in resolved_url:
+                            content = r.text
+                            meta_match = re.search(r'url=([^"\'>]+)', content, re.IGNORECASE)
+                            if meta_match: resolved_url = urljoin(prev_url, meta_match.group(1))
+                            else:
+                                js_match = re.search(r"location\.href\s*=\s*['\"](.*?)['\"]", content)
+                                if js_match: resolved_url = urljoin(prev_url, js_match.group(1))
+                        prev_url = resolved_url
+                        r.close()
+                        self.signals.log.emit(f"Resolved to: {prev_url}", "info")
+                    except Exception as e:
+                        self.signals.log.emit(f"Redirect resolution failed: {e}", "warning")
+                        
+                if 'job.php' not in prev_url:
+                    self.url_queue.append(prev_url)
+                else:
+                    self.signals.log.emit(f"Skipping failed redirect: {prev_url}", "warning")
+            else:
+                self.signals.log.emit("No previous topic found.", "warning")
 
     def download_image(self, img_url, page_url, page_title, page_date, index):
         max_retries = int(self.config.get('img_retries', 3))
         # 使用页面 URL 作为 Referer，但手动添加，不依赖 get_headers 参数
         headers = self.get_headers()
         headers['Referer'] = page_url
+        headers['Accept'] = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
         
         for attempt in range(max_retries):
             try:
@@ -458,6 +515,9 @@ class CrawlerWorker(QThread):
                 
                 if resp.status_code != 200:
                     raise Exception(f"HTTP {resp.status_code}")
+                content_type = resp.headers.get('Content-Type', '')
+                if 'text/html' in content_type.lower():
+                    raise Exception("HTML response (可能需要验证码/Cookie)")
 
                 content = b""
                 for chunk in resp.iter_content(chunk_size=8192):

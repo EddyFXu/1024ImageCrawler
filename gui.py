@@ -8,14 +8,24 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QRadioButton, QButtonGroup, 
     QCheckBox, QComboBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QScrollArea, QSplitter, QTextEdit, QTabWidget,
-    QGridLayout, QMessageBox, QDoubleSpinBox, QSpinBox, QSizePolicy, QGraphicsBlurEffect, QStackedLayout
+    QGridLayout, QMessageBox, QDoubleSpinBox, QSpinBox, QDateEdit, QDialog, QDialogButtonBox, QSizePolicy, QGraphicsBlurEffect, QStackedLayout
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QPointF, QUrl
+from PyQt6.QtCore import Qt, QSize, QTimer, QPointF, QUrl, QDate, QEventLoop
 from PyQt6.QtGui import QPixmap, QIcon, QColor, QAction, QPainter, QPen, QBrush, QPainterPath, QDesktopServices
 from crawler import CrawlerWorker
 from utils import get_app_path, get_resource_path
+from urllib.parse import urlparse
 
-VERSION = "v1.0.9"
+VERSION = "v1.2.3"
+
+WEBENGINE_IMPORT_ERROR = ""
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineProfile
+except Exception as e:
+    QWebEngineView = None
+    QWebEngineProfile = None
+    WEBENGINE_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 # Global exception hook to capture crashes in compiled exe
 def exception_hook(exctype, value, tb):
@@ -173,6 +183,84 @@ class ImagePreviewWidget(QWidget):
                     pass
         super().mouseDoubleClickEvent(event)
 
+class CookieBrowserDialog(QDialog):
+    def __init__(self, url, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("获取 Cookie")
+        self.resize(980, 720)
+        self.target_url = url
+        self.cookie_string = ""
+        self.user_agent = ""
+        self._cookie_by_name = {}
+        self._hostname = ""
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel("在下方页面完成验证后，点击“继续”将自动提取 Cookie 回填。")
+        layout.addWidget(info)
+
+        self._view = None
+        self._cookie_store = None
+        self._profile = None
+
+        if QWebEngineView is None or QWebEngineProfile is None:
+            detail = WEBENGINE_IMPORT_ERROR if WEBENGINE_IMPORT_ERROR else "未知原因"
+            msg = QLabel(f"内置浏览器组件不可用，无法在程序内打开验证页。\n原因: {detail}\n如运行源码：pip install PyQt6-WebEngine\n如运行EXE：请使用已包含内置浏览器的新版EXE")
+            layout.addWidget(msg)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+            return
+
+        parsed = urlparse(self.target_url) if self.target_url else None
+        self._hostname = parsed.hostname.lower() if parsed and parsed.hostname else ""
+
+        self._profile = QWebEngineProfile.defaultProfile()
+        self.user_agent = self._profile.httpUserAgent()
+        self._cookie_store = self._profile.cookieStore()
+        self._cookie_store.cookieAdded.connect(self._on_cookie_added)
+
+        self._view = QWebEngineView()
+        self._view.setUrl(QUrl(self.target_url))
+        layout.addWidget(self._view, 1)
+
+        buttons = QDialogButtonBox()
+        btn_continue = buttons.addButton("继续", QDialogButtonBox.ButtonRole.AcceptRole)
+        btn_cancel = buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
+        btn_continue.clicked.connect(self._on_continue)
+        btn_cancel.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_cookie_added(self, cookie):
+        try:
+            name = bytes(cookie.name()).decode(errors="ignore").strip()
+            value = bytes(cookie.value()).decode(errors="ignore").strip()
+            domain = cookie.domain().lstrip(".").lower()
+            if not name:
+                return
+            if self._hostname and domain and (domain == self._hostname or self._hostname.endswith("." + domain)):
+                self._cookie_by_name[name] = value
+        except:
+            return
+
+    def _on_continue(self):
+        if self._cookie_store:
+            try:
+                self._cookie_store.loadAllCookies()
+            except:
+                pass
+
+            loop = QEventLoop()
+            QTimer.singleShot(800, loop.quit)
+            loop.exec()
+
+        if self._cookie_by_name:
+            self.cookie_string = "; ".join([f"{k}={v}" for k, v in sorted(self._cookie_by_name.items())])
+        else:
+            self.cookie_string = ""
+
+        self.accept()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -196,6 +284,7 @@ class MainWindow(QMainWindow):
         
         self.total_tasks_count = 0
         self.total_images_count = 0
+        self.ua_override = ""
         
         self.init_ui()
         self.load_config()
@@ -261,6 +350,35 @@ class MainWindow(QMainWindow):
         filter_group = QGroupBox("图片过滤")
         filter_layout = QVBoxLayout()
         
+        # Title Keywords
+        keyword_layout = QHBoxLayout()
+        keyword_layout.addWidget(QLabel("标题关键词:"))
+        self.keyword_input = QLineEdit()
+        self.keyword_input.setPlaceholderText("多个词用空格或逗号分隔")
+        keyword_layout.addWidget(self.keyword_input)
+        filter_layout.addLayout(keyword_layout)
+
+        date_filter_layout = QHBoxLayout()
+        self.date_filter_check = QCheckBox("按发表时间过滤")
+        self.date_filter_check.setChecked(False)
+        date_filter_layout.addWidget(self.date_filter_check)
+        date_filter_layout.addWidget(QLabel("从"))
+        self.date_from_edit = QDateEdit()
+        self.date_from_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_from_edit.setCalendarPopup(True)
+        self.date_from_edit.setDate(QDate.currentDate())
+        self.date_from_edit.setEnabled(False)
+        date_filter_layout.addWidget(self.date_from_edit)
+        date_filter_layout.addWidget(QLabel("到"))
+        self.date_to_edit = QDateEdit()
+        self.date_to_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_to_edit.setCalendarPopup(True)
+        self.date_to_edit.setDate(QDate.currentDate())
+        self.date_to_edit.setEnabled(False)
+        date_filter_layout.addWidget(self.date_to_edit)
+        self.date_filter_check.toggled.connect(lambda checked: (self.date_from_edit.setEnabled(checked), self.date_to_edit.setEnabled(checked)))
+        filter_layout.addLayout(date_filter_layout)
+        
         # Resolution
         res_layout = QHBoxLayout()
         res_layout.addWidget(QLabel("最小分辨率:"))
@@ -315,6 +433,17 @@ class MainWindow(QMainWindow):
         
         set_layout.addWidget(QLabel("重命名规则:"))
         set_layout.addLayout(name_layout)
+
+        set_layout.addWidget(QLabel("Cookie(可选):"))
+        cookie_layout = QHBoxLayout()
+        self.cookie_input = QLineEdit()
+        self.cookie_input.setPlaceholderText("如遇验证码/验证，可点右侧按钮自动获取，或手动粘贴 Cookie")
+        btn_cookie = QPushButton("获取")
+        btn_cookie.setFixedWidth(50)
+        btn_cookie.clicked.connect(self.open_cookie_browser)
+        cookie_layout.addWidget(self.cookie_input, 1)
+        cookie_layout.addWidget(btn_cookie)
+        set_layout.addLayout(cookie_layout)
         
         set_group.setLayout(set_layout)
         left_layout.addWidget(set_group)
@@ -456,7 +585,21 @@ class MainWindow(QMainWindow):
             self.url_input.setText(data.get('url', ''))
             self.path_input.setText(data.get('save_dir', ''))
             self.naming_input.setText(data.get('naming', '{page.title}/{filename}'))
+            self.keyword_input.setText(data.get('keywords', ''))
+            self.cookie_input.setText(data.get('cookie', ''))
+            self.ua_override = data.get('ua_override', '')
             self.res_combo.setCurrentText(data.get('res', '不限制'))
+
+            date_filter_enabled = data.get('date_filter_enabled', False)
+            self.date_filter_check.setChecked(bool(date_filter_enabled))
+            date_from_str = data.get('date_from', '')
+            date_to_str = data.get('date_to', '')
+            date_from = QDate.fromString(date_from_str, "yyyy-MM-dd") if date_from_str else QDate()
+            date_to = QDate.fromString(date_to_str, "yyyy-MM-dd") if date_to_str else QDate()
+            if date_from.isValid():
+                self.date_from_edit.setDate(date_from)
+            if date_to.isValid():
+                self.date_to_edit.setDate(date_to)
             
             formats = data.get('formats', [])
             if formats:
@@ -499,6 +642,22 @@ class MainWindow(QMainWindow):
         if path:
             self.path_input.setText(path)
 
+    def open_cookie_browser(self):
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "提示", "请先输入目标地址，然后再获取 Cookie")
+            return
+
+        dlg = CookieBrowserDialog(url, self)
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            if dlg.cookie_string:
+                self.cookie_input.setText(dlg.cookie_string)
+                self.ua_override = dlg.user_agent or ""
+                self.save_config()
+            else:
+                QMessageBox.information(self, "提示", "未获取到 Cookie。请确认已在页面中完成验证后再点继续。")
+
     def show_naming_help(self):
         msg = """
         支持的命名参数：
@@ -527,6 +686,12 @@ class MainWindow(QMainWindow):
         config = {
             'save_dir': save_dir,
             'naming': self.naming_input.text().strip(),
+            'keywords': self.keyword_input.text().strip(),
+            'cookie': self.cookie_input.text().strip(),
+            'ua_override': self.ua_override,
+            'date_filter_enabled': self.date_filter_check.isChecked(),
+            'date_from': self.date_from_edit.date().toString("yyyy-MM-dd"),
+            'date_to': self.date_to_edit.date().toString("yyyy-MM-dd"),
             'mode': ['next', 'prev', 'free'][self.nav_bg.checkedId()],
             'min_res': self.parse_resolution(),
             'formats': [('.' + f if not f.startswith('.') else f) for f, cb in self.fmt_checks.items() if cb.isChecked()],
@@ -743,6 +908,12 @@ class MainWindow(QMainWindow):
             'url': self.url_input.text(),
             'save_dir': self.path_input.text(),
             'naming': self.naming_input.text(),
+            'keywords': self.keyword_input.text(),
+            'cookie': self.cookie_input.text(),
+            'ua_override': self.ua_override,
+            'date_filter_enabled': self.date_filter_check.isChecked(),
+            'date_from': self.date_from_edit.date().toString("yyyy-MM-dd"),
+            'date_to': self.date_to_edit.date().toString("yyyy-MM-dd"),
             'res': self.res_combo.currentText(),
             'formats': [f for f, cb in self.fmt_checks.items() if cb.isChecked()],
             'page_delay': (self.page_delay_min.value(), self.page_delay_max.value()),
