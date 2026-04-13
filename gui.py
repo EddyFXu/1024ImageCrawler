@@ -16,7 +16,7 @@ from crawler import CrawlerWorker
 from utils import get_app_path, get_resource_path
 from urllib.parse import urlparse
 
-VERSION = "v1.2.3"
+VERSION = "v1.2.6"
 
 WEBENGINE_IMPORT_ERROR = ""
 try:
@@ -53,6 +53,7 @@ sys.excepthook = exception_hook
 
 # Config file should be stored in the app directory (or user data dir, but app dir is fine for portable)
 CONFIG_FILE = os.path.join(get_app_path(), "config.json")
+PROGRESS_FILE = os.path.join(get_app_path(), "progress_state.json")
 
 class ImagePreviewWidget(QWidget):
     def __init__(self):
@@ -525,7 +526,7 @@ class MainWindow(QMainWindow):
         self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.task_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.task_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.task_table.setColumnWidth(4, 60)
+        self.task_table.setColumnWidth(4, 48)
         self.task_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.task_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         task_layout.addWidget(self.task_table)
@@ -659,17 +660,27 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "提示", "未获取到 Cookie。请确认已在页面中完成验证后再点继续。")
 
     def show_naming_help(self):
-        msg = """
-        支持的命名参数：
-        {filename}: 原始文件名
-        {no.10001}: 自增序号 (从10001开始)
-        {origin_serial}: 原始链接中的序号
-        {page.title}: 帖子标题
-        {page.date}: 帖子日期 (YYYY-MM-DD)
-        {YYYY}, {MM}, {DD}: 年月日
-        {HH}, {mm}, {ss}: 时分秒
-        """
-        QMessageBox.information(self, "重命名规则帮助", msg)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("重命名规则帮助")
+        dlg.resize(520, 360)
+        layout = QVBoxLayout(dlg)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(
+            "支持的命名参数：\n"
+            "{filename}: 原始文件名\n"
+            "{no.10001}: 自增序号 (从10001开始)\n"
+            "{origin_serial}: 原始链接中的序号\n"
+            "{page.title}: 帖子标题\n"
+            "{page.date}: 帖子日期 (YYYY-MM-DD)\n"
+            "{YYYY}, {MM}, {DD}: 年月日\n"
+            "{HH}, {mm}, {ss}: 时分秒\n"
+        )
+        layout.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        dlg.exec()
 
     def start_crawler(self):
         url = self.url_input.text().strip()
@@ -708,13 +719,30 @@ class MainWindow(QMainWindow):
         self.total_tasks_count = 0
         self.total_images_count = 0
         
-        self.worker = CrawlerWorker(url, config)
+        start_url = url
+        try:
+            if os.path.exists(PROGRESS_FILE):
+                with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+                    state = json.load(f)
+                state_mode = state.get("mode", "")
+                state_start = state.get("start_url", "")
+                state_last = state.get("last_url", "")
+                state_finished = bool(state.get("finished", False))
+                if (not state_finished) and state_mode == config.get("mode") and state_start == url and state_last:
+                    start_url = state_last
+                    self.log(f"检测到上次进度，已从断点继续: {start_url}", "warning")
+        except Exception as e:
+            self.log(f"读取进度失败，将从头开始: {e}", "warning")
+
+        self.last_progress_state = None
+        self.worker = CrawlerWorker(start_url, config)
         self.worker.signals.log.connect(self.log)
         self.worker.signals.status_update.connect(self.update_task_status)
         self.worker.signals.redirected.connect(self.update_redirected_url)
         self.worker.signals.image_downloaded.connect(self.add_image_to_gallery)
         self.worker.signals.finished.connect(self.on_finished)
         self.worker.signals.bandwidth_update.connect(self.on_bandwidth_update)
+        self.worker.signals.state_update.connect(self.on_state_update)
         
         self.worker.start()
         
@@ -746,6 +774,23 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.bandwidth_label.setText("当前带宽: 0 KB/s")
+        if getattr(self, "last_progress_state", None) is not None:
+            try:
+                state = dict(self.last_progress_state)
+                state["finished"] = True
+                state["saved_at"] = int(time.time())
+                with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(state, f, ensure_ascii=False)
+            except:
+                pass
+
+    def on_state_update(self, state):
+        self.last_progress_state = state
+        try:
+            with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"写入进度失败: {e}", "warning")
 
     def on_bandwidth_update(self, total_bytes):
         self.total_bytes_downloaded = total_bytes
@@ -770,8 +815,21 @@ class MainWindow(QMainWindow):
     def update_redirected_url(self, old_url, new_url):
         rows = self.task_table.rowCount()
         for r in range(rows):
-            if self.task_table.item(r, 1).text() == old_url:
-                self.task_table.setItem(r, 1, QTableWidgetItem(new_url))
+            item = self.task_table.item(r, 1)
+            if item and item.data(Qt.ItemDataRole.UserRole + 1) == old_url:
+                item.setData(Qt.ItemDataRole.UserRole + 1, new_url)
+                w = self.task_table.cellWidget(r, 1)
+                if w:
+                    label = w.findChild(QLabel, "url_label")
+                    if label:
+                        label.setText(new_url)
+                        label.setToolTip(new_url)
+                    btn = w.findChild(QPushButton, "copy_btn")
+                    if btn:
+                        btn.setProperty("url", new_url)
+                    btn_open = self.task_table.cellWidget(r, 4).findChild(QPushButton, "open_btn") if self.task_table.cellWidget(r, 4) else None
+                    if btn_open:
+                        btn_open.setProperty("url", new_url)
                 break
 
     def update_task_status(self, url, status, title, date_str, local_path=""):
@@ -779,7 +837,8 @@ class MainWindow(QMainWindow):
         rows = self.task_table.rowCount()
         found_row = -1
         for r in range(rows):
-            if self.task_table.item(r, 1).text() == url:
+            item = self.task_table.item(r, 1)
+            if item and item.data(Qt.ItemDataRole.UserRole + 1) == url:
                 found_row = r
                 break
         
@@ -787,23 +846,41 @@ class MainWindow(QMainWindow):
             # Insert at top (reverse order)
             self.task_table.insertRow(0)
             found_row = 0
-            self.task_table.setItem(0, 1, QTableWidgetItem(url))
+            url_item = QTableWidgetItem("")
+            url_item.setData(Qt.ItemDataRole.UserRole + 1, url)
+            self.task_table.setItem(0, 1, url_item)
             
             # Set custom row number (cumulative count)
             self.total_tasks_count += 1
             self.task_table.setVerticalHeaderItem(0, QTableWidgetItem(str(self.total_tasks_count)))
             
-            # Add Open Folder Button
+            url_widget = QWidget()
+            url_layout = QHBoxLayout(url_widget)
+            url_layout.setContentsMargins(0, 0, 0, 0)
+            url_layout.setSpacing(6)
+            url_label = QLabel(url)
+            url_label.setObjectName("url_label")
+            url_label.setToolTip(url)
+            url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            url_layout.addWidget(url_label, 1)
+            btn_copy = QPushButton("📋")
+            btn_copy.setObjectName("copy_btn")
+            btn_copy.setToolTip("复制地址")
+            btn_copy.setFixedSize(26, 22)
+            btn_copy.setStyleSheet("padding: 0px;")
+            btn_copy.setProperty("url", url)
+            btn_copy.clicked.connect(self.copy_task_url_from_sender)
+            url_layout.addWidget(btn_copy)
+            self.task_table.setCellWidget(0, 1, url_widget)
+
             btn_open = QPushButton("📂")
+            btn_open.setObjectName("open_btn")
             btn_open.setToolTip("打开文件夹")
             btn_open.setFixedSize(30, 24)
             btn_open.setStyleSheet("padding: 2px;")
-            # Use lambda with default argument to capture current path, but wait, local_path might change?
-            # Actually local_path is sent with updates. We should store it in the item data.
-            # But here we can just connect it to a method that reads the data.
-            btn_open.clicked.connect(lambda: self.open_task_folder(url))
+            btn_open.setProperty("url", url)
+            btn_open.clicked.connect(self.open_task_folder_from_sender)
             
-            # Center the button
             widget = QWidget()
             layout = QHBoxLayout(widget)
             layout.setContentsMargins(0,0,0,0)
@@ -813,7 +890,9 @@ class MainWindow(QMainWindow):
 
         # Store local_path in the URL item for retrieval
         if local_path:
-             self.task_table.item(found_row, 1).setData(Qt.ItemDataRole.UserRole, local_path)
+            item = self.task_table.item(found_row, 1)
+            if item:
+                item.setData(Qt.ItemDataRole.UserRole, local_path)
             
         # Update status icon
         icon_label = QLabel()
@@ -851,7 +930,7 @@ class MainWindow(QMainWindow):
         rows = self.task_table.rowCount()
         for r in range(rows):
             item = self.task_table.item(r, 1)
-            if item.text() == url:
+            if item and item.data(Qt.ItemDataRole.UserRole + 1) == url:
                 local_path = item.data(Qt.ItemDataRole.UserRole)
                 if local_path and os.path.exists(local_path):
                     try:
@@ -864,6 +943,24 @@ class MainWindow(QMainWindow):
                     # So we just warn
                     pass
                 break
+
+    def open_task_folder_from_sender(self):
+        sender = self.sender()
+        if sender:
+            url = sender.property("url")
+            if isinstance(url, str) and url:
+                self.open_task_folder(url)
+
+    def copy_task_url(self, url):
+        QApplication.clipboard().setText(url)
+        self.log("已复制地址到剪贴板", "success")
+
+    def copy_task_url_from_sender(self):
+        sender = self.sender()
+        if sender:
+            url = sender.property("url")
+            if isinstance(url, str) and url:
+                self.copy_task_url(url)
 
     def add_image_to_gallery(self, url, path):
         # Insert at top (reverse order)

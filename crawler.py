@@ -20,11 +20,15 @@ class CrawlerSignals(QObject):
     progress = pyqtSignal(str, int, int)
     image_downloaded = pyqtSignal(str, str)
     bandwidth_update = pyqtSignal(int)
+    state_update = pyqtSignal(dict)
     finished = pyqtSignal()
 
 class CrawlerWorker(QThread):
     def __init__(self, start_url, config):
         super().__init__()
+        self.start_url = start_url
+        self.last_processed_url = start_url
+        self._last_state_emit_ts = 0
         self.url_queue = [start_url]
         self.visited_urls = set()
         self.config = config
@@ -49,16 +53,31 @@ class CrawlerWorker(QThread):
             self.session.headers.update({'Cookie': cookie})
         
     def run(self):
+        mode = self.config.get('mode', 'next')
         try:
-            mode = self.config.get('mode', 'next') # next, prev, free
-            
             while self.is_running and self.url_queue:
                 current_url = self.url_queue.pop(0)
                 if current_url in self.visited_urls:
                     continue
                     
                 self.visited_urls.add(current_url)
+                self.last_processed_url = current_url
                 self.process_page(current_url, mode)
+                now = time.time()
+                if now - self._last_state_emit_ts >= 60:
+                    self._last_state_emit_ts = now
+                    try:
+                        self.signals.state_update.emit({
+                            "start_url": self.start_url,
+                            "last_url": self.last_processed_url,
+                            "mode": mode,
+                            "visited_count": len(self.visited_urls),
+                            "queue_count": len(self.url_queue),
+                            "finished": False,
+                            "saved_at": int(now)
+                        })
+                    except:
+                        pass
                 
                 # Anti-scraping delay
                 p_min, p_max = self.config.get('page_delay', (2.0, 5.0))
@@ -71,6 +90,18 @@ class CrawlerWorker(QThread):
             import traceback
             traceback.print_exc()
         finally:
+            try:
+                self.signals.state_update.emit({
+                    "start_url": self.start_url,
+                    "last_url": self.last_processed_url,
+                    "mode": mode,
+                    "visited_count": len(self.visited_urls),
+                    "queue_count": len(self.url_queue),
+                    "finished": True,
+                    "saved_at": int(time.time())
+                })
+            except:
+                pass
             self.signals.finished.emit()
         
     def stop(self):
